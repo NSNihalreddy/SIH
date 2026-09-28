@@ -1,4 +1,5 @@
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +18,13 @@ from app.api.routes_audit import router as audit_router
 from app.db.session import get_db
 
 app = FastAPI(title="DATA MINE API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://datamine.onrender.com"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(documents_router)
 app.include_router(processing_router)
 app.include_router(extraction_router)
