@@ -1,0 +1,5 @@
+.viewer-account-table { min-width: 840px; }
+.viewer-account-table td strong, .viewer-account-username { display: block; }
+.viewer-account-username { color: var(--color-muted); font-size: 10px; }
+.form-notice { margin: 0 0 12px; color: var(--color-good); font-size: 11px; }
+.auth-mode-toggle { align-self: center; justify-content: center; margin-top: 14px; }
