@@ -225,6 +225,9 @@ async def rag_query(
             }
 
         except Exception as fallback_exc:
+            import traceback
+            traceback.print_exc()
+            
             await _audit(
                 session,
                 actor,
