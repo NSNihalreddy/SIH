@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 from datetime import datetime, timezone
@@ -252,6 +253,24 @@ async def rag_query(
             ) from fallback_exc
 
 
+_INDEX_TASKS: set[asyncio.Task] = set()
+
+
+async def _run_index_task(job_id: uuid.UUID):
+    """Run the existing Celery task in a worker thread on Render Free.
+
+    The task implementation is synchronous and may create its own asyncio
+    event loop, so it must not be executed directly on FastAPI's event loop.
+    """
+    await asyncio.to_thread(index_document_version_task.run, str(job_id))
+
+
+def _schedule_index_task(job_id: uuid.UUID) -> None:
+    task = asyncio.create_task(_run_index_task(job_id))
+    _INDEX_TASKS.add(task)
+    task.add_done_callback(_INDEX_TASKS.discard)
+
+
 async def _submit_index(session: AsyncSession, document: Document, version: DocumentVersion, actor: User, force: bool = False):
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:version_id, 11))"), {"version_id": str(version.id)})
     latest = await session.scalar(select(IndexingJob).where(IndexingJob.document_version_id == version.id).order_by(IndexingJob.created_at.desc()).limit(1).with_for_update())
@@ -268,14 +287,11 @@ async def _submit_index(session: AsyncSession, document: Document, version: Docu
             and latest.embedding_dimension == VECTOR_EMBEDDING_DIMENSION else None))
     session.add(job)
     await session.commit()
-    try:
-        index_document_version_task.apply_async(args=[str(job.id)])
-    except Exception as exc:
-        job = await session.get(IndexingJob, job.id)
-        job.status, job.completed_at = "FAILED", datetime.now(timezone.utc)
-        job.error_message = f"Could not submit indexing task ({type(exc).__name__})"
-        await session.commit()
-        raise HTTPException(503, {"status": "FAILED", "job_id": str(job.id), "detail": "Indexing queue is unavailable"}) from exc
+
+    # Render Free has no Celery worker. Run the same task in a background
+    # thread so the HTTP event loop remains responsive.
+    _schedule_index_task(job.id)
+
     return job, True
 
 
