@@ -94,17 +94,37 @@ async def create_report(request: ReportRequest, actor: Generator,
     session.add(AuditLog(actor_id=actor.id, action="REPORT_CREATED", entity_type="REPORT", entity_id=report.id,
         details={"report_type": report.report_type, "parameters": parameters}, source="reports_api"))
     await session.commit()
-    try:
-        generate_report_task.apply_async(args=[str(report.id)], task_id=f"report-{report.id}", queue="reports")
+        try:
+        generate_report_task.run(str(report.id))
     except Exception as exc:
         report = await session.get(Report, report.id)
-        report.status = "FAILED"; report.error_message = "Report queue is unavailable"
+        report.status = "FAILED"
+        report.error_message = str(exc)
         report.completed_at = datetime.now(timezone.utc)
         await session.commit()
-        session.add(AuditLog(actor_id=actor.id, action="REPORT_GENERATION_FAILED", entity_type="REPORT", entity_id=report.id,
-            details={"error_type": type(exc).__name__}, source="reports_api")); await session.commit()
-        raise HTTPException(503, "Report queue is unavailable") from exc
-    return {"report_id": str(report.id), "status": report.status, "submitted": True}
+
+        session.add(
+            AuditLog(
+                actor_id=actor.id,
+                action="REPORT_GENERATION_FAILED",
+                entity_type="REPORT",
+                entity_id=report.id,
+                details={"error_type": type(exc).__name__},
+                source="reports_api",
+            )
+        )
+        await session.commit()
+
+        raise HTTPException(
+            500,
+            f"Report generation failed: {exc}",
+        ) from exc
+
+    return {
+        "report_id": str(report.id),
+        "status": report.status,
+        "submitted": True,
+    }
 
 
 @router.get("")
