@@ -130,7 +130,7 @@ async def rag_query(
 
         return result
 
-   except (EmbeddingUnavailable, EmbeddingProviderError, OSError) as exc:
+    except (EmbeddingUnavailable, EmbeddingProviderError, OSError) as exc:
         # Render fallback:
         # semantic embeddings are unavailable, so use PostgreSQL
         # lexical retrieval instead of returning HTTP 503.
@@ -227,7 +227,7 @@ async def rag_query(
         except Exception as fallback_exc:
             import traceback
             traceback.print_exc()
-            
+
             await _audit(
                 session,
                 actor,
@@ -336,6 +336,7 @@ async def clear_version_vectors(version_id: uuid.UUID, request: ClearVectorsRequ
                                 actor: Admin, session: AsyncSession = Depends(get_db)):
     """Clear only explicitly confirmed embedding fields for one version before a dimension migration."""
     if request.confirm_version_id != version_id:
+        
         raise HTTPException(400, "Confirmation version id must match the route version id")
     version = await session.get(DocumentVersion, version_id)
     if version is None:
