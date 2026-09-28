@@ -97,17 +97,156 @@ async def lexical_search(request: SearchRequest, actor: Reader, session: AsyncSe
 
 
 @router.post("/rag/query")
-async def rag_query(request: RAGRequest, actor: Reader, session: AsyncSession = Depends(get_db)):
+async def rag_query(
+    request: RAGRequest,
+    actor: Reader,
+    session: AsyncSession = Depends(get_db),
+):
     start = time.perf_counter()
+    filters = request.filters.model_dump(exclude_none=True)
+
     try:
-        result = await answer_question(session, request.question, request.top_k, request.filters.model_dump(exclude_none=True))
-    except (EmbeddingUnavailable, EmbeddingProviderError) as exc:
-        await _audit(session, actor, request.question, 0, [], EMBEDDING_PROVIDER or None, LLM_MODEL or None, "EMBEDDING_UNAVAILABLE", start)
-        raise HTTPException(503, {"status": "EMBEDDING_UNAVAILABLE", "detail": str(exc)}) from exc
-    model = llm_configuration()
-    await _audit(session, actor, request.question, len(result["evidence"]), [item["result_id"] for item in result["evidence"]],
-        model["provider"], model["model"], result["status"], start)
-    return result
+        # Primary path: hybrid semantic + lexical RAG
+        result = await answer_question(
+            session,
+            request.question,
+            request.top_k,
+            filters,
+        )
+
+        model = llm_configuration()
+
+        await _audit(
+            session,
+            actor,
+            request.question,
+            len(result["evidence"]),
+            [item["result_id"] for item in result["evidence"]],
+            model["provider"],
+            model["model"],
+            result["status"],
+            start,
+        )
+
+        return result
+
+   except (EmbeddingUnavailable, EmbeddingProviderError, OSError) as exc:
+        # Render fallback:
+        # semantic embeddings are unavailable, so use PostgreSQL
+        # lexical retrieval instead of returning HTTP 503.
+        from app.services.evidence import retrieve_evidence
+
+        try:
+            results = await search_chunks(
+                session,
+                request.question.strip(),
+                top_k=request.top_k,
+                filters=filters,
+                mode="lexical",
+            )
+
+            evidence = [
+                await retrieve_evidence(session, item)
+                for item in results
+            ]
+
+            evidence_ids = [
+                item["result_id"]
+                for item in evidence
+            ]
+
+            await _audit(
+                session,
+                actor,
+                request.question,
+                len(evidence),
+                evidence_ids,
+                "postgresql_fts",
+                None,
+                "LEXICAL_FALLBACK",
+                start,
+            )
+
+            if not evidence:
+                return {
+                    "status": "INSUFFICIENT_EVIDENCE",
+                    "answer": (
+                        "No matching source evidence was found "
+                        "for this question."
+                    ),
+                    "evidence": [],
+                    "limitations": [
+                        "Semantic embeddings are unavailable.",
+                        "Lexical retrieval returned no matching evidence.",
+                    ],
+                    "retrieval_metadata": {
+                        "mode": "lexical_fallback",
+                        "embedding_error": str(exc),
+                    },
+                }
+
+            # Evidence-bound response without relying on the broken
+            # local embedding model.
+            answer_parts = []
+
+            for index, item in enumerate(evidence[:request.top_k], 1):
+                text_value = (
+                    item.get("text")
+                    or item.get("content")
+                    or ""
+                ).strip()
+
+                if text_value:
+                    answer_parts.append(
+                        f"[E{index}] {text_value[:1200]}"
+                    )
+
+            answer = (
+                "The following source evidence was retrieved "
+                "for your question:\n\n"
+                + "\n\n".join(answer_parts)
+            )
+
+            return {
+                "status": "LEXICAL_FALLBACK",
+                "answer": answer,
+                "evidence": evidence,
+                "limitations": [
+                    "Semantic retrieval was unavailable.",
+                    "Results were retrieved using lexical "
+                    "source-text matching.",
+                ],
+                "retrieval_metadata": {
+                    "mode": "lexical_fallback",
+                    "semantic_weight": 0,
+                    "lexical_weight": 1,
+                    "embedding_error": str(exc),
+                },
+            }
+
+        except Exception as fallback_exc:
+            await _audit(
+                session,
+                actor,
+                request.question,
+                0,
+                [],
+                "postgresql_fts",
+                None,
+                "LEXICAL_FALLBACK_FAILED",
+                start,
+            )
+
+            raise HTTPException(
+                503,
+                {
+                    "status": "QUERY_UNAVAILABLE",
+                    "detail": (
+                        "Semantic retrieval is unavailable and "
+                        "lexical fallback also failed."
+                    ),
+                },
+            ) from fallback_exc
 
 
 async def _submit_index(session: AsyncSession, document: Document, version: DocumentVersion, actor: User, force: bool = False):
