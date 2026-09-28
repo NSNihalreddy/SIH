@@ -72,7 +72,7 @@ async def submit_processing(document_id: uuid.UUID, actor: Operator, session: As
     queued_stage_id = queued_stage.id
 
     try:
-        process_document_task.apply_async(args=[str(job_id)])
+        process_document_task(str(job_id))
     except Exception as exc:
         await session.rollback()
         failed_at = datetime.now(timezone.utc)
