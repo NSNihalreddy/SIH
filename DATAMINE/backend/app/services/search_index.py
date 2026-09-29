@@ -63,6 +63,53 @@ def _valid_index_vector(chunk: DocumentChunk, model: str, dimension: int) -> boo
     return bool(chunk.is_indexed and _has_valid_vector(chunk, model, dimension))
 
 
+async def _complete_lexical_index(
+    session,
+    job: IndexingJob,
+    version_id: uuid.UUID,
+) -> dict:
+    """Complete indexing using source text when embeddings are unavailable.
+
+    PostgreSQL lexical retrieval and Step 12 intelligence only require
+    trusted/indexed source text. They must not depend on a local Torch
+    embedding runtime on Render Free.
+    """
+    chunks = list(
+        (
+            await session.execute(
+                select(DocumentChunk)
+                .where(DocumentChunk.document_version_id == version_id)
+                .order_by(DocumentChunk.chunk_index)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for chunk in chunks:
+        if chunk.text and chunk.text.strip():
+            chunk.is_indexed = True
+
+    job.vector_count = 0
+    job.status = "COMPLETED"
+    job.completed_at = datetime.now(timezone.utc)
+    job.error_message = None
+    await session.commit()
+
+    logger.info(
+        "Lexical indexing completed job_id=%s chunks=%d vectors=0",
+        job.id,
+        job.chunk_count,
+    )
+    return {
+        "job_id": str(job.id),
+        "status": "COMPLETED",
+        "chunk_count": job.chunk_count,
+        "vector_count": 0,
+        "index_mode": "lexical",
+    }
+
+
 async def _run_gemini_batch_step(session, job: IndexingJob, version_id: uuid.UUID,
                                  model: str, dimension: int) -> dict:
     """Submit/poll bounded provider batches; commit each completed batch atomically."""
@@ -285,37 +332,105 @@ async def run_indexing_job(job_id: uuid.UUID) -> dict:
             if not chunk_total:
                 raise ValueError("No processed page content or trusted data is available to index")
 
-            if EMBEDDING_PROVIDER == "gemini":
-                return await _run_gemini_batch_step(session, job, version_id, job_model, job_dimension)
+            try:
+                if EMBEDDING_PROVIDER == "gemini":
+                    return await _run_gemini_batch_step(
+                        session,
+                        job,
+                        version_id,
+                        job_model,
+                        job_dimension,
+                    )
 
-            batch_size = EMBEDDING_BATCH_SIZE
-            previous_batch_succeeded = False
-            while True:
-                batch = list((await session.execute(select(DocumentChunk).where(DocumentChunk.document_version_id == version.id)
-                    .where(or_(DocumentChunk.embedding.is_(None),
-                        DocumentChunk.embedding_model.is_distinct_from(job_model),
-                        DocumentChunk.embedding_dimension.is_distinct_from(job_dimension),
-                        DocumentChunk.is_indexed.is_(False)))
-                    .order_by(DocumentChunk.chunk_index).limit(batch_size))).scalars().all())
-                if not batch:
-                    break
-                await _pace_gemini_request(previous_batch_succeeded)
-                vectors = await embed_texts([item.text for item in batch])
-                if len(vectors) != len(batch):
-                    raise ValueError("Embedding batch returned an unexpected number of vectors")
-                for item, vector in zip(batch, vectors):
-                    if len(vector) != job_dimension or not all(math.isfinite(float(value)) for value in vector):
-                        raise ValueError("Embedding dimension changed during indexing")
-                    item.embedding, item.embedding_model, item.embedding_dimension = vector, job_model, job_dimension
-                    item.is_indexed = True
-                job.vector_count = stored_vectors + len(batch)
+                batch_size = EMBEDDING_BATCH_SIZE
+                previous_batch_succeeded = False
+                while True:
+                    batch = list(
+                        (
+                            await session.execute(
+                                select(DocumentChunk)
+                                .where(
+                                    DocumentChunk.document_version_id
+                                    == version.id
+                                )
+                                .where(
+                                    or_(
+                                        DocumentChunk.embedding.is_(None),
+                                        DocumentChunk.embedding_model.is_distinct_from(
+                                            job_model
+                                        ),
+                                        DocumentChunk.embedding_dimension.is_distinct_from(
+                                            job_dimension
+                                        ),
+                                        DocumentChunk.is_indexed.is_(False),
+                                    )
+                                )
+                                .order_by(DocumentChunk.chunk_index)
+                                .limit(batch_size)
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    if not batch:
+                        break
+
+                    await _pace_gemini_request(previous_batch_succeeded)
+                    vectors = await embed_texts([item.text for item in batch])
+                    if len(vectors) != len(batch):
+                        raise ValueError(
+                            "Embedding batch returned an unexpected number of vectors"
+                        )
+
+                    for item, vector in zip(batch, vectors):
+                        if len(vector) != job_dimension or not all(
+                            math.isfinite(float(value)) for value in vector
+                        ):
+                            raise ValueError(
+                                "Embedding dimension changed during indexing"
+                            )
+                        item.embedding = vector
+                        item.embedding_model = job_model
+                        item.embedding_dimension = job_dimension
+                        item.is_indexed = True
+
+                    job.vector_count = stored_vectors + len(batch)
+                    await session.commit()
+                    stored_vectors += len(batch)
+                    previous_batch_succeeded = True
+
+                job.status = "COMPLETED"
+                job.completed_at = datetime.now(timezone.utc)
                 await session.commit()
-                stored_vectors += len(batch)
-                previous_batch_succeeded = True
-            job.status, job.completed_at = "COMPLETED", datetime.now(timezone.utc)
-            await session.commit()
-            logger.info("Indexing completed job_id=%s chunks=%d vectors=%d", job.id, job.chunk_count, job.vector_count)
-            return {"job_id": str(job.id), "status": job.status, "chunk_count": job.chunk_count, "vector_count": job.vector_count}
+                logger.info(
+                    "Indexing completed job_id=%s chunks=%d vectors=%d",
+                    job.id,
+                    job.chunk_count,
+                    job.vector_count,
+                )
+                return {
+                    "job_id": str(job.id),
+                    "status": job.status,
+                    "chunk_count": job.chunk_count,
+                    "vector_count": job.vector_count,
+                }
+
+            except (EmbeddingUnavailable, EmbeddingProviderError, OSError) as exc:
+                # Render Free fallback: preserve the extracted source text as
+                # indexed evidence even when vector embeddings are unavailable.
+                await session.rollback()
+                job = await session.get(IndexingJob, job_id)
+                logger.warning(
+                    "Embeddings unavailable; completing lexical index "
+                    "job_id=%s error_type=%s",
+                    job_id,
+                    type(exc).__name__,
+                )
+                return await _complete_lexical_index(
+                    session,
+                    job,
+                    version_id,
+                )
         except Exception as exc:
             await session.rollback()
             # Keep every previously committed valid vector and derive progress from storage.
