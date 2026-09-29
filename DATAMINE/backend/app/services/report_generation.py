@@ -65,13 +65,13 @@ def _document_report(session: Session, report: Report, payload: dict) -> dict:
         if {uuid.UUID(value) for value in selected_ids} - found:
             raise ValueError("One or more selected source documents do not exist")
     source_chunk_ids = [uuid.UUID(value) for value in evidence_map]
-    from app.core.config import EMBEDDING_MODEL, VECTOR_EMBEDDING_DIMENSION
     chunks = session.execute(select(DocumentChunk, Document.original_filename, DocumentPage.page_number)
         .join(Document, Document.id == DocumentChunk.document_id)
         .outerjoin(DocumentPage, DocumentPage.id == DocumentChunk.document_page_id)
-        .where(DocumentChunk.id.in_(source_chunk_ids), DocumentChunk.is_indexed.is_(True),
-            DocumentChunk.embedding.is_not(None), DocumentChunk.embedding_model == EMBEDDING_MODEL,
-            DocumentChunk.embedding_dimension == VECTOR_EMBEDDING_DIMENSION)
+        .where(
+            DocumentChunk.id.in_(source_chunk_ids),
+            DocumentChunk.is_indexed.is_(True),
+        )
         .order_by(DocumentChunk.document_id, DocumentChunk.chunk_index)).all() if source_chunk_ids else []
     evidence, citations_by_chunk = [], {}
     for chunk, filename, page_number in chunks:
