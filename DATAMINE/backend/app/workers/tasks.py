@@ -80,11 +80,7 @@ def build_intelligence_task(self, run_id: str) -> dict:
     from datetime import datetime, timezone
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import sessionmaker
-    from app.core.config import (
-        SYNC_DATABASE_URL,
-        EMBEDDING_MODEL,
-        VECTOR_EMBEDDING_DIMENSION,
-    )
+    from app.core.config import SYNC_DATABASE_URL
     from app.models.analytics import IntelligenceRun
     from app.models.rag import DocumentChunk
     from app.models.documents import DocumentPage
@@ -113,6 +109,10 @@ def build_intelligence_task(self, run_id: str) -> dict:
                     "status": "NOT_CLAIMED",
                 }
 
+            # Intelligence extraction uses the indexed chunk text and
+            # provenance, not vector similarity. Render Free can run the
+            # lexical indexing path when local Torch/embeddings are
+            # unavailable, so do not require a non-null vector here.
             stmt = (
                 select(
                     DocumentChunk,
@@ -124,10 +124,6 @@ def build_intelligence_task(self, run_id: str) -> dict:
                 )
                 .where(
                     DocumentChunk.is_indexed.is_(True),
-                    DocumentChunk.embedding.is_not(None),
-                    DocumentChunk.embedding_model == EMBEDDING_MODEL,
-                    DocumentChunk.embedding_dimension
-                    == VECTOR_EMBEDDING_DIMENSION,
                 )
             )
 
