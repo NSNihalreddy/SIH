@@ -5,20 +5,18 @@ from uuid import UUID, uuid4
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.config import (
-    SYNC_DATABASE_URL,
-    EMBEDDING_PROVIDER,
-    EMBEDDING_MODEL,
-    VECTOR_EMBEDDING_DIMENSION,
-)
+from app.core.config import SYNC_DATABASE_URL
 from app.models.documents import Document, DocumentPage, DocumentVersion
-from app.models.intelligence import ExtractedContent, ExtractedTable, ExtractedTableCell
+from app.models.intelligence import (
+    ExtractedContent,
+    ExtractedTable,
+    ExtractedTableCell,
+)
 from app.models.processing import ProcessingJob, ProcessingStage
-from app.models.rag import IndexingJob
 from app.processors.base import ProcessingResult
 from app.processors.router import ProcessorRouter
 from app.storage.base import StorageService
-from app.workers.indexing import run_indexing_task
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +28,11 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _transition(session: Session, job: ProcessingJob, stage_name: str) -> None:
+def _transition(
+    session: Session,
+    job: ProcessingJob,
+    stage_name: str,
+) -> None:
     previous = session.execute(
         select(ProcessingStage)
         .where(
@@ -97,7 +99,6 @@ def _persist_result(
     job: ProcessingJob,
     result: ProcessingResult,
 ) -> None:
-
     if not result.pages:
         raise ProcessingFailure(
             "Processor returned no document pages or source units"
@@ -177,7 +178,6 @@ def _mark_failed(
     job: ProcessingJob,
     exc: Exception,
 ) -> None:
-
     now = _utcnow()
 
     current = session.execute(
@@ -191,17 +191,16 @@ def _mark_failed(
     ).scalar_one_or_none()
 
     error_message = (
-        f"{type(exc).__name__}: {str(exc)[:1800]}"
+        f"{type(exc).__name__}: "
+        f"{str(exc)[:1800]}"
     )
 
     if current is not None:
-
         current.status = "FAILED"
         current.error_message = error_message
         current.completed_at = now
 
     else:
-
         session.add(
             ProcessingStage(
                 job_id=job.id,
@@ -219,109 +218,6 @@ def _mark_failed(
     session.commit()
 
 
-def _start_indexing(
-    document_id: UUID,
-    document_version_id: UUID,
-) -> dict:
-    """
-    Automatically create and execute the search indexing job.
-
-    Render Free does not have a Celery worker, so the existing
-    run_indexing_task() is executed directly.
-    """
-
-    from sqlalchemy import create_engine
-
-    engine = create_engine(
-        SYNC_DATABASE_URL,
-        pool_pre_ping=True,
-    )
-
-    session_factory = sessionmaker(
-        bind=engine,
-        expire_on_commit=False,
-    )
-
-    try:
-
-        with session_factory() as session:
-
-            existing = session.execute(
-                select(IndexingJob)
-                .where(
-                    IndexingJob.document_version_id
-                    == document_version_id,
-                    IndexingJob.status.in_(
-                        ["PENDING", "PROCESSING"]
-                    ),
-                )
-                .order_by(
-                    IndexingJob.created_at.desc()
-                )
-                .limit(1)
-            ).scalar_one_or_none()
-
-            if existing is not None:
-
-                job_id = existing.id
-
-                logger.info(
-                    "Existing indexing job found "
-                    "document_version_id=%s job_id=%s",
-                    document_version_id,
-                    job_id,
-                )
-
-            else:
-
-                job = IndexingJob(
-                    document_id=document_id,
-                    document_version_id=document_version_id,
-                    status="PENDING",
-                    provider=EMBEDDING_PROVIDER or None,
-                    embedding_model=EMBEDDING_MODEL or None,
-                    embedding_dimension=VECTOR_EMBEDDING_DIMENSION,
-                    requested_by=None,
-                )
-
-                session.add(job)
-                session.commit()
-
-                job_id = job.id
-
-                logger.info(
-                    "Created indexing job "
-                    "document_version_id=%s job_id=%s",
-                    document_version_id,
-                    job_id,
-                )
-
-        logger.info(
-            "Starting automatic indexing "
-            "document_version_id=%s job_id=%s",
-            document_version_id,
-            job_id,
-        )
-
-        result = run_indexing_task(
-            str(job_id)
-        )
-
-        logger.info(
-            "Automatic indexing finished "
-            "document_version_id=%s job_id=%s result=%s",
-            document_version_id,
-            job_id,
-            result,
-        )
-
-        return result
-
-    finally:
-
-        engine.dispose()
-
-
 def process_document_job(
     job_id: UUID | str,
     storage: StorageService,
@@ -333,7 +229,6 @@ def process_document_job(
     engine = None
 
     if session_factory is None:
-
         engine = create_engine(
             SYNC_DATABASE_URL,
             pool_pre_ping=True,
@@ -361,14 +256,14 @@ def process_document_job(
                 )
 
             if job.status == "COMPLETED":
-
                 return {
                     "job_id": str(job.id),
                     "status": "COMPLETED",
                 }
 
             job.started_at = (
-                job.started_at or _utcnow()
+                job.started_at
+                or _utcnow()
             )
 
             job.completed_at = None
@@ -395,7 +290,6 @@ def process_document_job(
             )
 
             if version is None or document is None:
-
                 raise ProcessingFailure(
                     "Document version or document no longer exists"
                 )
@@ -415,13 +309,15 @@ def process_document_job(
 
             result = processor.process(
                 version.storage_key,
-                lambda stage: _transition(
-                    session,
-                    job,
-                    stage,
-                )
-                if job.status != stage
-                else None,
+                lambda stage: (
+                    _transition(
+                        session,
+                        job,
+                        stage,
+                    )
+                    if job.status != stage
+                    else None
+                ),
             )
 
             _transition(
@@ -454,33 +350,10 @@ def process_document_job(
                 "COMPLETED",
             )
 
-            # ---------------------------------------------------------
-            # AUTOMATIC SEARCH INDEXING
-            # ---------------------------------------------------------
-            #
-            # Processing is now complete.
-            #
-            # Render Free does not have a Celery worker, so we directly
-            # execute the existing indexing task here.
-            #
-            # This makes processed document text available to:
-            #   - Query
-            #   - Intelligence
-            #   - Reports
-            #
-            # No verification rules are changed here.
-            # ---------------------------------------------------------
-
-            index_result = _start_indexing(
-                document_id=document.id,
-                document_version_id=version.id,
-            )
-
             return {
                 "job_id": str(job.id),
                 "status": job.status,
                 "page_count": len(result.pages),
-                "indexing": index_result,
             }
 
     except Exception as exc:
@@ -504,7 +377,6 @@ def process_document_job(
                     job is not None
                     and job.status != "COMPLETED"
                 ):
-
                     _mark_failed(
                         session,
                         job,
