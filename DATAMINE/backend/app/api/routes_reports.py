@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -23,6 +24,20 @@ from app.workers.tasks import generate_report_task
 
 
 router = APIRouter(prefix="/api/v1/reports", tags=["reports"])
+
+
+_REPORT_TASKS: set[asyncio.Task] = set()
+
+
+async def _run_report_task(report_id: uuid.UUID) -> None:
+    """Run report generation off FastAPI's event loop on Render Free."""
+    await asyncio.to_thread(generate_report_task.run, str(report_id))
+
+
+def _schedule_report_task(report_id: uuid.UUID) -> None:
+    task = asyncio.create_task(_run_report_task(report_id))
+    _REPORT_TASKS.add(task)
+    task.add_done_callback(_REPORT_TASKS.discard)
 
 Reader = Annotated[
     User,
@@ -228,38 +243,9 @@ async def create_report(
 
     await session.commit()
 
-    # Render Free has no Celery worker, so execute directly.
-    try:
-        generate_report_task.run(str(report.id))
-
-    except Exception as exc:
-        report = await session.get(Report, report.id)
-
-        report.status = "FAILED"
-        report.error_message = str(exc)
-        report.completed_at = datetime.now(timezone.utc)
-
-        await session.commit()
-
-        session.add(
-            AuditLog(
-                actor_id=actor.id,
-                action="REPORT_GENERATION_FAILED",
-                entity_type="REPORT",
-                entity_id=report.id,
-                details={
-                    "error_type": type(exc).__name__
-                },
-                source="reports_api",
-            )
-        )
-
-        await session.commit()
-
-        raise HTTPException(
-            500,
-            f"Report generation failed: {exc}",
-        ) from exc
+    # Render Free has no Celery worker. Run the existing Celery task
+    # in a background thread so the FastAPI event loop stays responsive.
+    _schedule_report_task(report.id)
 
     return {
         "report_id": str(report.id),
