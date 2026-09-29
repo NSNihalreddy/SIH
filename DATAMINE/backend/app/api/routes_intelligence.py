@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import require_roles
-from app.core.config import EMBEDDING_MODEL, VECTOR_EMBEDDING_DIMENSION, MAX_CONTEXT_CHARACTERS
+from app.core.config import MAX_CONTEXT_CHARACTERS
 from app.db.session import get_db
 from app.models.analytics import IntelligenceRun
 from app.models.documents import Document, DocumentPage
@@ -27,6 +28,20 @@ Reader = Annotated[User, Depends(require_roles("ADMIN", "VERIFIER", "ANALYST", "
 Operator = Annotated[User, Depends(require_roles("ADMIN", "VERIFIER", "ANALYST"))]
 Admin = Annotated[User, Depends(require_roles("ADMIN"))]
 _CITATION = re.compile(r"\[(E\d+)\]")
+
+
+_INTELLIGENCE_TASKS: set[asyncio.Task] = set()
+
+
+async def _run_intelligence_task(run_id: uuid.UUID) -> None:
+    """Run the existing synchronous task off FastAPI's event loop."""
+    await asyncio.to_thread(build_intelligence_task.run, str(run_id))
+
+
+def _schedule_intelligence_task(run_id: uuid.UUID) -> None:
+    task = asyncio.create_task(_run_intelligence_task(run_id))
+    _INTELLIGENCE_TASKS.add(task)
+    task.add_done_callback(_INTELLIGENCE_TASKS.discard)
 
 
 async def _audit(session: AsyncSession, actor: User, action: str, entity_id: uuid.UUID | None, details: dict):
@@ -48,24 +63,26 @@ async def build_index(actor: Operator, session: AsyncSession = Depends(get_db)):
     if active:
         return {"run_id": active.id, "status": active.status, "submitted": False}
     latest = await _latest(session)
-    current_count = int(await session.scalar(select(func.count(DocumentChunk.id)).where(
-        DocumentChunk.is_indexed.is_(True), DocumentChunk.embedding.is_not(None),
-        DocumentChunk.embedding_model == EMBEDDING_MODEL,
-        DocumentChunk.embedding_dimension == VECTOR_EMBEDDING_DIMENSION)) or 0)
+    current_count = int(
+        await session.scalar(
+            select(func.count(DocumentChunk.id)).where(
+                DocumentChunk.is_indexed.is_(True),
+            )
+        )
+        or 0
+    )
     if latest and latest.source_chunk_count == current_count:
         return {"run_id": latest.id, "status": latest.status, "submitted": False, "idempotent_reuse": True}
     run = IntelligenceRun(scope="CORPUS", status="PENDING", requested_by=actor.id)
     session.add(run)
     await session.flush()
     await _audit(session, actor, "INTELLIGENCE_BUILD_REQUESTED", run.id, {"scope": "CORPUS"})
-    try:
-        build_intelligence_task.apply_async(args=[str(run.id)])
-    except Exception as exc:
-        run.status = "FAILED"
-        run.error_message = f"Queue unavailable ({type(exc).__name__})"
-        run.completed_at = datetime.now(timezone.utc)
-        await session.commit()
-        raise HTTPException(503, {"status": "FAILED", "run_id": str(run.id), "detail": "Intelligence queue is unavailable"}) from exc
+    await session.commit()
+
+    # Render Free has no Celery worker. Run the existing intelligence task
+    # in a background thread so the FastAPI event loop remains responsive.
+    _schedule_intelligence_task(run.id)
+
     return {"run_id": run.id, "status": run.status, "submitted": True}
 
 
@@ -93,15 +110,12 @@ async def requeue_run(run_id: uuid.UUID, actor: Admin, session: AsyncSession = D
     session.add(AuditLog(actor_id=actor.id, action="INTELLIGENCE_RUN_REQUEUED", entity_type="INTELLIGENCE",
         entity_id=run.id, details={"scope": run.scope, "previous_status": "PENDING"}, source="intelligence_api"))
     await session.flush()
-    try:
-        # Publish while holding the row and corpus advisory locks. The worker's
-        # SELECT FOR UPDATE claim waits for this transaction and then observes QUEUED.
-        build_intelligence_task.apply_async(args=[str(run.id)], task_id=f"intelligence-run-{run.id}")
-    except Exception as exc:
-        await session.rollback()
-        raise HTTPException(503, {"status": "PENDING", "run_id": str(run.id),
-            "detail": "Could not submit the intelligence task; the run remains requeueable"}) from exc
     await session.commit()
+
+    # Render Free has no Celery worker; execute the same task locally in a
+    # background thread after the transaction is committed.
+    _schedule_intelligence_task(run.id)
+
     return {"run_id": run.id, "status": run.status, "submitted": True}
 
 
@@ -153,10 +167,14 @@ async def keywords(actor: Reader, page: int = Query(1, ge=1), page_size: int = Q
     run = await _latest(session)
     items = (run.result or {}).get("keywords", []) if run else []
     if document_id:
-        chunk_rows = (await session.execute(select(DocumentChunk).where(DocumentChunk.document_id == document_id,
-            DocumentChunk.is_indexed.is_(True), DocumentChunk.embedding.is_not(None),
-            DocumentChunk.embedding_model == EMBEDDING_MODEL,
-            DocumentChunk.embedding_dimension == VECTOR_EMBEDDING_DIMENSION))).scalars().all()
+        chunk_rows = (
+            await session.execute(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id == document_id,
+                    DocumentChunk.is_indexed.is_(True),
+                )
+            )
+        ).scalars().all()
         summary = extract_document_intelligence([{"text": c.text, "document_id": c.document_id,
             "document_version_id": c.document_version_id, "page_id": c.document_page_id,
             "page_number": (c.source_metadata or {}).get("page_number"), "chunk_id": c.id,
@@ -181,8 +199,11 @@ async def analyze(request: AnalyzeRequest, actor: Operator, session: AsyncSessio
     rows = (await session.execute(select(DocumentChunk, Document.original_filename, DocumentPage.page_number)
         .join(Document, Document.id == DocumentChunk.document_id)
         .outerjoin(DocumentPage, DocumentPage.id == DocumentChunk.document_page_id)
-        .where(DocumentChunk.document_id.in_(request.document_ids), DocumentChunk.is_indexed.is_(True),
-            DocumentChunk.embedding.is_not(None)).order_by(DocumentChunk.document_id, DocumentChunk.chunk_index))).all()
+        .where(
+            DocumentChunk.document_id.in_(request.document_ids),
+            DocumentChunk.is_indexed.is_(True),
+        )
+        .order_by(DocumentChunk.document_id, DocumentChunk.chunk_index))).all()
     grouped: dict[str, list[dict]] = {str(doc_id): [] for doc_id in request.document_ids}
     names = {}
     evidence = []
