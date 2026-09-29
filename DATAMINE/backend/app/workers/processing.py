@@ -18,8 +18,7 @@ from app.models.rag import IndexingJob
 from app.processors.base import ProcessingResult
 from app.processors.router import ProcessorRouter
 from app.storage.base import StorageService
-from app.workers.search_index import run_indexing_task
-
+from app.workers.indexing import run_indexing_task
 logger = logging.getLogger(__name__)
 
 
