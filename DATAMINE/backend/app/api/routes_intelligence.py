@@ -50,6 +50,7 @@ async def _audit(session: AsyncSession, actor: User, action: str, entity_id: uui
     await session.commit()
 
 
+
 async def _latest(session: AsyncSession):
     return await session.scalar(select(IntelligenceRun).where(IntelligenceRun.scope == "CORPUS",
         IntelligenceRun.status == "COMPLETED").order_by(IntelligenceRun.completed_at.desc()).limit(1))
